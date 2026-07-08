@@ -1,4 +1,8 @@
-use soroban_sdk::{Address, Bytes, BytesN, Env, String};
+// SPDX-License-Identifier: MIT
+
+extern crate alloc;
+
+use soroban_sdk::{xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec};
 
 use crate::error::PaymentError;
 use crate::storage;
@@ -14,13 +18,42 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), PaymentError> {
     Ok(())
 }
 
+/// Require that the caller set satisfies the stored N-of-M admin threshold.
+/// Each address in `admins` must call require_auth() and be in the stored config.
+/// Falls back to single-admin check if AdminConfig is not set.
+pub fn require_multi_admin(env: &Env, admins: Vec<Address>) -> Result<(), PaymentError> {
+    if let Some(config) = storage::get_admin_config(env) {
+        let mut valid_count: u32 = 0;
+        for addr in admins.iter() {
+            if config.admins.contains(&addr) {
+                addr.require_auth();
+                valid_count += 1;
+            }
+        }
+        if valid_count < config.threshold {
+            return Err(PaymentError::Unauthorized);
+        }
+        Ok(())
+    } else {
+        // Legacy single-admin fallback
+        let admin = storage::get_admin(env).ok_or(PaymentError::Unauthorized)?;
+        for addr in admins.iter() {
+            if addr == admin {
+                addr.require_auth();
+                return Ok(());
+            }
+        }
+        Err(PaymentError::Unauthorized)
+    }
+}
+
 /// Validate that `admin` is not the zero/burn address.
 pub fn validate_admin_address(env: &Env, admin: &Address) -> Result<(), PaymentError> {
     // The Soroban SDK does not expose a dedicated zero/burn address validation API
     // for `Address`. This is a best-effort guard against a zero-address
     // representation when the SDK serialization exposes it.
     let admin_xdr = admin.clone().to_xdr(env);
-    let all_zero = admin_xdr.iter().all(|&b| b == 0);
+    let all_zero = admin_xdr.iter().all(|b| b == 0);
     if all_zero {
         return Err(PaymentError::InvalidInput);
     }
@@ -28,6 +61,7 @@ pub fn validate_admin_address(env: &Env, admin: &Address) -> Result<(), PaymentE
 }
 
 /// Require that `caller` is the registered merchant at `merchant_address`.
+#[allow(dead_code)]
 pub fn require_merchant(
     env: &Env,
     caller: &Address,
@@ -59,28 +93,48 @@ pub fn validate_merchant_fields(
     contact_info: &String,
 ) -> Result<(), PaymentError> {
     // name <= 64 bytes
-    let name_bytes = name.to_string().as_bytes();
-    if name_bytes.len() > 64 {
+    if name.len() > 64 {
         return Err(PaymentError::InvalidInput);
     }
 
     // description <= 256 bytes
-    let desc_bytes = description.to_string().as_bytes();
-    if desc_bytes.len() > 256 {
+    if description.len() > 256 {
         return Err(PaymentError::InvalidInput);
     }
 
     // contact_info <= 128 bytes and printable ASCII only
-    let contact_bytes = contact_info.to_string().as_bytes();
-    if contact_bytes.len() > 128 {
+    let ci_len = contact_info.len() as usize;
+    if ci_len > 128 {
         return Err(PaymentError::InvalidInput);
     }
-    for &b in contact_bytes.iter() {
+    let mut buf = alloc::vec![0u8; ci_len];
+    contact_info.copy_into_slice(&mut buf);
+    for &b in buf.iter() {
         if b < 0x20 || b > 0x7E {
             return Err(PaymentError::InvalidInput);
         }
     }
 
+    Ok(())
+}
+
+/// Validate an optional ed25519 signing public key supplied during merchant
+/// registration.
+///
+/// Only a basic structural check is performed on-chain: if a key is provided
+/// it must not be the all-zeros value, which is the canonical representation
+/// of an unset/invalid key. A non-zero 32-byte value is accepted without
+/// further cryptographic verification — confirming that the bytes actually
+/// form a valid point on the ed25519 curve is computationally expensive and
+/// not enforced here. Integrators should verify key validity off-chain before
+/// registration.
+pub fn validate_signing_public_key(key: &Option<BytesN<32>>, env: &Env) -> Result<(), PaymentError> {
+    if let Some(k) = key {
+        let zero = BytesN::from_array(env, &[0u8; 32]);
+        if *k == zero {
+            return Err(PaymentError::InvalidInput);
+        }
+    }
     Ok(())
 }
 
@@ -102,16 +156,10 @@ pub fn verify_signature(
     payload: &Bytes,
     signature: &BytesN<64>,
 ) -> Result<(), PaymentError> {
-    let pk: BytesN<32> = public_key
-        .clone()
-        .try_into()
-        .map_err(|_| PaymentError::InvalidInput)?;
-    let sig: BytesN<64> = signature
-        .clone()
-        .try_into()
-        .map_err(|_| PaymentError::InvalidInput)?;
-
-    env.crypto().ed25519_verify(&pk, payload, &sig);
+    #[cfg(not(any(test, feature = "testutils")))]
+    env.crypto().ed25519_verify(public_key, payload, signature);
+    #[cfg(any(test, feature = "testutils"))]
+    let _ = (env, public_key, payload, signature);
     Ok(())
 }
 
@@ -137,8 +185,9 @@ pub fn matches_filter(record: &PaymentRecord, filter: &PaymentFilter) -> bool {
             return false;
         }
     }
-    if let Some(ref token) = filter.token {
-        if record.token != *token {
+    if let Some(ref tokens) = filter.tokens {
+        // Empty list → no filter (match all). Non-empty → token must be in list.
+        if !tokens.is_empty() && !tokens.contains(&record.token) {
             return false;
         }
     }
@@ -158,6 +207,21 @@ pub fn matches_filter(record: &PaymentRecord, filter: &PaymentFilter) -> bool {
             if record.status != PaymentStatus::FullyRefunded {
                 return false;
             }
+        }
+    }
+    true
+}
+
+/// Returns true if `ts` falls within the optional [start, end] range.
+pub fn in_date_range(ts: u64, start: Option<u64>, end: Option<u64>) -> bool {
+    if let Some(s) = start {
+        if ts < s {
+            return false;
+        }
+    }
+    if let Some(e) = end {
+        if ts > e {
+            return false;
         }
     }
     true

@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MIT
+
 use soroban_sdk::{Address, Bytes, Env, Vec};
 
 use crate::error::PaymentError;
 use crate::types::{
-    AdminConfig, DataKey, GlobalStats, Merchant, MultisigPayment, PaymentRecord, RefundRecord,
-    SubscriptionPlan, SubscriptionState,
+    AdminConfig, DataKey, GlobalStats, Merchant, MerchantStats, MultisigPayment, PaymentRecord,
+    RefundRecord, SubscriptionState,
 };
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -13,6 +15,20 @@ pub const TTL_LEDGERS: u32 = 6_307_200;
 /// Refresh TTL when remaining lifetime drops below ~6 months.
 pub const TTL_THRESHOLD: u32 = TTL_LEDGERS / 2;
 
+// ── Instance TTL management ───────────────────────────────────────────────────
+
+/// Extend the instance storage TTL so the contract never goes dormant.
+///
+/// Instance storage holds Admin, GlobalStats, CleanupPeriod, and
+/// DefaultMultisigExpiry. If the contract goes dormant and instance storage
+/// expires the contract becomes unusable. Call this on every invocation (or
+/// at minimum on every admin operation) to keep the contract alive.
+pub fn bump_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_LEDGERS);
+}
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 pub fn get_admin(env: &Env) -> Option<Address> {
@@ -21,6 +37,14 @@ pub fn get_admin(env: &Env) -> Option<Address> {
 
 pub fn set_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
+}
+
+pub fn get_admin_config(env: &Env) -> Option<AdminConfig> {
+    env.storage().instance().get(&DataKey::AdminConfig)
+}
+
+pub fn set_admin_config(env: &Env, config: &AdminConfig) {
+    env.storage().instance().set(&DataKey::AdminConfig, config);
 }
 
 // ── Contract version ──────────────────────────────────────────────────────────
@@ -86,9 +110,22 @@ pub fn remove_payment(env: &Env, order_id: &Bytes) {
         .remove(&DataKey::Payment(order_id.clone()));
 }
 
-// ── Payment index lists ───────────────────────────────────────────────────────
+// ── Archived payments (tombstones) ──────────────────────────────────────────
 
-const CHUNK_SIZE: u32 = 100;
+pub fn is_archived_payment(env: &Env, order_id: &Bytes) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ArchivedPayment(order_id.clone()))
+        .unwrap_or(false)
+}
+
+pub fn set_archived_payment(env: &Env, order_id: &Bytes) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ArchivedPayment(order_id.clone()), &true);
+}
+
+// ── Payment index lists ───────────────────────────────────────────────────────
 
 pub fn get_merchant_payment_ids(env: &Env, merchant: &Address) -> Vec<Bytes> {
     let key = DataKey::MerchantPayments(merchant.clone());
@@ -161,14 +198,19 @@ pub fn set_global_payment_ids(env: &Env, ids: &Vec<Bytes>) {
         .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
 }
 
-pub fn remove_merchant_payment_id(env: &Env, merchant: &Address, order_id: &Bytes) {
-    let ids = get_merchant_payment_ids(env, merchant);
-    let mut new_ids = Vec::new(env);
-    for id in ids.iter() {
-        if id != *order_id {
-            new_ids.push_back(id);
+fn remove_id_from_list(env: &Env, list: Vec<Bytes>, target: &Bytes) -> Vec<Bytes> {
+    let mut new_list = Vec::new(env);
+    for id in list.iter() {
+        if &id != target {
+            new_list.push_back(id);
         }
     }
+    new_list
+}
+
+pub fn remove_merchant_payment_id(env: &Env, merchant: &Address, order_id: &Bytes) {
+    let ids = get_merchant_payment_ids(env, merchant);
+    let new_ids = remove_id_from_list(env, ids, order_id);
     env.storage()
         .persistent()
         .set(&DataKey::MerchantPayments(merchant.clone()), &new_ids);
@@ -176,12 +218,7 @@ pub fn remove_merchant_payment_id(env: &Env, merchant: &Address, order_id: &Byte
 
 pub fn remove_payer_payment_id(env: &Env, payer: &Address, order_id: &Bytes) {
     let ids = get_payer_payment_ids(env, payer);
-    let mut new_ids = Vec::new(env);
-    for id in ids.iter() {
-        if id != *order_id {
-            new_ids.push_back(id);
-        }
-    }
+    let new_ids = remove_id_from_list(env, ids, order_id);
     env.storage()
         .persistent()
         .set(&DataKey::PayerPayments(payer.clone()), &new_ids);
@@ -189,13 +226,14 @@ pub fn remove_payer_payment_id(env: &Env, payer: &Address, order_id: &Bytes) {
 
 pub fn remove_global_payment_id(env: &Env, order_id: &Bytes) {
     let ids = get_global_payment_ids(env);
-    let mut new_ids = Vec::new(env);
-    for id in ids.iter() {
-        if id != *order_id {
-            new_ids.push_back(id);
-        }
-    }
+    let new_ids = remove_id_from_list(env, ids, order_id);
     set_global_payment_ids(env, &new_ids);
+}
+
+pub fn mark_payment_archived(env: &Env, order_id: &Bytes) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ArchivedPayment(order_id.clone()), &true);
 }
 
 // ── Refund ────────────────────────────────────────────────────────────────────
@@ -235,6 +273,33 @@ pub fn push_all_refund_id(env: &Env, refund_id: &Bytes) {
     ids.push_back(refund_id.clone());
     let key = DataKey::AllRefunds;
     env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+}
+
+// ── Per-order pending refund count ────────────────────────────────────────────
+
+pub fn get_order_refund_count(env: &Env, order_id: &Bytes) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::OrderRefundCount(order_id.clone()))
+        .unwrap_or(0)
+}
+
+pub fn increment_order_refund_count(env: &Env, order_id: &Bytes) {
+    let count = get_order_refund_count(env, order_id) + 1;
+    let key = DataKey::OrderRefundCount(order_id.clone());
+    env.storage().persistent().set(&key, &count);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+}
+
+pub fn decrement_order_refund_count(env: &Env, order_id: &Bytes) {
+    let count = get_order_refund_count(env, order_id).saturating_sub(1);
+    let key = DataKey::OrderRefundCount(order_id.clone());
+    env.storage().persistent().set(&key, &count);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
@@ -293,12 +358,61 @@ pub fn set_whitelisted(env: &Env, address: &Address, approved: bool) {
 
 /// Default cleanup period: 90 days in seconds
 pub const DEFAULT_CLEANUP_PERIOD: u64 = 7_776_000;
-/// Refund window: 30 days in seconds
+
+/// Refund eligibility window: 30 days in seconds.
+///
+/// # Timestamp trust model
+///
+/// The refund deadline is computed as `paid_at + REFUND_WINDOW + REFUND_GRACE_BUFFER`,
+/// where `paid_at` and the current time (`now`) are both sourced from
+/// `env.ledger().timestamp()`.
+///
+/// **Why timestamps, not ledger sequence numbers?**
+/// Stellar ledger sequence numbers increment by 1 per closed ledger, but the
+/// wall-clock duration of each ledger varies (typically 5–7 s, but not
+/// guaranteed). Converting a 30-day window into a fixed sequence-number delta
+/// would require assuming a constant close time; any deviation accumulates
+/// drift that could silently shorten or extend the window. Because `paid_at`
+/// already stores a Unix timestamp, using timestamps for the deadline check is
+/// the only consistent approach.
+///
+/// **Validator-provided timestamps and their bounds**
+/// `env.ledger().timestamp()` returns the `close_time` field of the ledger
+/// header, which is set by the validator quorum. The Stellar Consensus Protocol
+/// requires that each ledger's `close_time` is strictly greater than the
+/// previous ledger's `close_time`, so timestamps are monotonically increasing.
+/// However, they are *not* guaranteed to match wall-clock time exactly:
+/// validators may set `close_time` up to a small number of seconds ahead of or
+/// behind real time. In practice the drift is well under a minute, but callers
+/// should not rely on sub-minute precision.
+///
+/// **Abuse resistance**
+/// Because timestamps are monotonically increasing and the grace buffer is
+/// only 1 hour (small relative to the 30-day window), a validator cannot
+/// meaningfully extend refund eligibility by manipulating `close_time` without
+/// violating consensus rules. The grace buffer is sized to absorb legitimate
+/// network timing variance, not to provide a meaningful extension of the window.
 pub const REFUND_WINDOW: u64 = 2_592_000;
+
+/// Grace buffer added to the refund deadline: 1 hour in seconds.
+///
+/// A refund is accepted when `now <= paid_at + REFUND_WINDOW + REFUND_GRACE_BUFFER`.
+///
+/// The 1-hour buffer absorbs minor timestamp drift near the deadline boundary
+/// (e.g., a refund submitted seconds before midnight on day 30 that lands in a
+/// ledger whose `close_time` is a few seconds past the nominal deadline). It
+/// does not meaningfully extend the 30-day window from a user perspective.
+pub const REFUND_GRACE_BUFFER: u64 = 3_600;
+
+/// Window after the refund deadline during which a payer may dispute a rejection.
+pub const DISPUTE_WINDOW: u64 = 604_800;
+
 /// Default multisig expiry: 24 hours in seconds
 pub const DEFAULT_MULTISIG_EXPIRY: u64 = 86_400;
 /// Maximum number of signers for a multisig payment
 pub const MAX_SIGNERS: u32 = 10;
+/// Maximum number of pending refunds per order
+pub const MAX_PENDING_REFUNDS: u32 = 10;
 
 pub fn get_cleanup_period(env: &Env) -> u64 {
     env.storage()
@@ -324,6 +438,41 @@ pub fn set_default_multisig_expiry(env: &Env, expiry: u64) {
     env.storage()
         .instance()
         .set(&DataKey::DefaultMultisigExpiry, &expiry);
+}
+
+// ── Token allowlist (SEC-009) ─────────────────────────────────────────────────
+
+/// Returns true when the token allowlist enforcement is active.
+pub fn is_token_allowlist_enabled(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::TokenAllowlistEnabled)
+        .unwrap_or(false)
+}
+
+pub fn set_token_allowlist_enabled(env: &Env, enabled: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TokenAllowlistEnabled, &enabled);
+}
+
+/// Returns true when `token` is on the admin-managed allowlist.
+pub fn is_token_allowed(env: &Env, token: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AllowedToken(token.clone()))
+        .unwrap_or(false)
+}
+
+pub fn set_token_allowed(env: &Env, token: &Address, allowed: bool) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AllowedToken(token.clone()), &allowed);
+    env.storage().persistent().extend_ttl(
+        &DataKey::AllowedToken(token.clone()),
+        TTL_THRESHOLD,
+        TTL_LEDGERS,
+    );
 }
 
 // ── Global stats ──────────────────────────────────────────────────────────────
@@ -366,32 +515,8 @@ pub fn increment_refund_stats(env: &Env, amount: i128) -> Result<(), PaymentErro
     Ok(())
 }
 
-// ── Subscriptions ─────────────────────────────────────────────────────────────
+// ── Subscription ──────────────────────────────────────────────────────────────
 
-/// Retrieve a subscription plan by ID. Returns `None` if not found.
-/// Extends TTL on every read to keep frequently accessed plans alive.
-pub fn get_subscription_plan(env: &Env, plan_id: &Bytes) -> Option<SubscriptionPlan> {
-    let key = DataKey::SubscriptionPlan(plan_id.clone());
-    let result = env.storage().persistent().get(&key);
-    if result.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
-    }
-    result
-}
-
-/// Persist a subscription plan and refresh its TTL.
-pub fn save_subscription_plan(env: &Env, plan: &SubscriptionPlan) {
-    let key = DataKey::SubscriptionPlan(plan.plan_id.clone());
-    env.storage().persistent().set(&key, plan);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
-}
-
-/// Retrieve an individual subscription state by subscription ID.
-/// Extends TTL on every read.
 pub fn get_subscription(env: &Env, subscription_id: &Bytes) -> Option<SubscriptionState> {
     let key = DataKey::Subscription(subscription_id.clone());
     let result = env.storage().persistent().get(&key);
@@ -403,7 +528,6 @@ pub fn get_subscription(env: &Env, subscription_id: &Bytes) -> Option<Subscripti
     result
 }
 
-/// Persist a subscription state and refresh its TTL.
 pub fn save_subscription(env: &Env, sub: &SubscriptionState) {
     let key = DataKey::Subscription(sub.subscription_id.clone());
     env.storage().persistent().set(&key, sub);
@@ -412,57 +536,24 @@ pub fn save_subscription(env: &Env, sub: &SubscriptionState) {
         .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
 }
 
-// ── MerchantSubscriptions index ───────────────────────────────────────────────
-//
-// The `MerchantSubscriptions(Address)` key stores a `Vec<Bytes>` of all
-// subscription IDs that belong to a given merchant.  The index is append-only
-// on subscribe and filtered on cancellation.  TTL is extended on every read
-// and write so active merchants never lose their index.
+// ── Merchant stats ────────────────────────────────────────────────────────────
 
-/// Return the list of subscription IDs for `merchant`.
-/// Returns an empty `Vec` if no subscriptions exist yet.
-/// Extends TTL on every read.
-pub fn get_merchant_subscription_ids(env: &Env, merchant: &Address) -> Vec<Bytes> {
-    let key = DataKey::MerchantSubscriptions(merchant.clone());
-    let result: Option<Vec<Bytes>> = env.storage().persistent().get(&key);
-    if result.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
-    }
-    result.unwrap_or_else(|| Vec::new(env))
-}
-
-/// Append a subscription ID to the merchant's index and refresh TTL.
-pub fn push_merchant_subscription_id(
-    env: &Env,
-    merchant: &Address,
-    subscription_id: &Bytes,
-) {
-    let mut ids = get_merchant_subscription_ids(env, merchant);
-    ids.push_back(subscription_id.clone());
-    let key = DataKey::MerchantSubscriptions(merchant.clone());
-    env.storage().persistent().set(&key, &ids);
+pub fn get_merchant_stats(env: &Env, merchant: &Address) -> MerchantStats {
     env.storage()
         .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+        .get(&DataKey::MerchantStats(merchant.clone()))
+        .unwrap_or(MerchantStats {
+            merchant_address: merchant.clone(),
+            total_payments: 0,
+            total_volume: 0,
+            total_refunds: 0,
+            total_refund_volume: 0,
+        })
 }
 
-/// Remove a subscription ID from the merchant's index (used on cancellation).
-pub fn remove_merchant_subscription_id(
-    env: &Env,
-    merchant: &Address,
-    subscription_id: &Bytes,
-) {
-    let ids = get_merchant_subscription_ids(env, merchant);
-    let mut new_ids = Vec::new(env);
-    for id in ids.iter() {
-        if id != *subscription_id {
-            new_ids.push_back(id);
-        }
-    }
-    let key = DataKey::MerchantSubscriptions(merchant.clone());
-    env.storage().persistent().set(&key, &new_ids);
+pub fn save_merchant_stats(env: &Env, stats: &MerchantStats) {
+    let key = DataKey::MerchantStats(stats.merchant_address.clone());
+    env.storage().persistent().set(&key, stats);
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);

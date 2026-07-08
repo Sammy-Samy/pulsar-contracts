@@ -22,6 +22,7 @@ use storage::REFUND_WINDOW;
 use types::{
     DataKey, GlobalStats, Merchant, MerchantCategory, MultisigPayment, PaymentFilter, PaymentOrder,
     PaymentPage, PaymentRecord, PaymentStatus, RefundRecord, RefundStatus, SortField, SortOrder,
+    SubscriptionPage, SubscriptionPlan, SubscriptionState, SubscriptionStatus, BillingInterval,
 };
 
 #[contract]
@@ -765,6 +766,237 @@ impl PaymentContract {
             (payment_id, executor, order.amount),
         );
         Ok(())
+    }
+
+    // ── Subscriptions ─────────────────────────────────────────────────────────
+
+    /// Create a new subscription plan.
+    ///
+    /// The calling merchant must be registered and active.  The `plan_id` must
+    /// be globally unique.
+    pub fn create_subscription_plan(
+        env: Env,
+        merchant: Address,
+        plan_id: Bytes,
+        token: Address,
+        amount: i128,
+        name: String,
+        description: String,
+        interval: BillingInterval,
+    ) -> Result<(), PaymentError> {
+        merchant.require_auth();
+
+        // Verify merchant is registered and active
+        let m = storage::get_merchant(&env, &merchant).ok_or(PaymentError::MerchantNotFound)?;
+        if !m.active {
+            return Err(PaymentError::MerchantInactive);
+        }
+
+        helper::validate_amount(amount)?;
+
+        if storage::get_subscription_plan(&env, &plan_id).is_some() {
+            return Err(PaymentError::PaymentAlreadyExists);
+        }
+
+        let now = env.ledger().timestamp();
+        let plan = SubscriptionPlan {
+            plan_id: plan_id.clone(),
+            merchant_address: merchant.clone(),
+            token,
+            amount,
+            name,
+            description,
+            interval,
+            active: true,
+            created_at: now,
+        };
+        storage::save_subscription_plan(&env, &plan);
+
+        env.events().publish(
+            (String::from_str(&env, "subscription_plan_created"),),
+            (plan_id, merchant),
+        );
+        Ok(())
+    }
+
+    /// Subscribe to an existing plan.
+    ///
+    /// Stores a `SubscriptionState` record under `DataKey::Subscription(subscription_id)`
+    /// and appends the `subscription_id` to the `MerchantSubscriptions(merchant)` index.
+    /// Both the record and the index have their TTL refreshed on this call.
+    pub fn subscribe(
+        env: Env,
+        subscriber: Address,
+        subscription_id: Bytes,
+        plan_id: Bytes,
+    ) -> Result<(), PaymentError> {
+        subscriber.require_auth();
+
+        if storage::get_subscription(&env, &subscription_id).is_some() {
+            return Err(PaymentError::PaymentAlreadyExists);
+        }
+
+        let plan = storage::get_subscription_plan(&env, &plan_id)
+            .ok_or(PaymentError::PaymentNotFound)?;
+
+        if !plan.active {
+            return Err(PaymentError::MerchantInactive);
+        }
+
+        let now = env.ledger().timestamp();
+        let interval_seconds: u64 = match plan.interval {
+            BillingInterval::Weekly => 7 * 24 * 3600,
+            BillingInterval::Monthly => 30 * 24 * 3600,
+            BillingInterval::Yearly => 365 * 24 * 3600,
+        };
+
+        let sub = SubscriptionState {
+            subscription_id: subscription_id.clone(),
+            plan_id: plan_id.clone(),
+            merchant_address: plan.merchant_address.clone(),
+            subscriber: subscriber.clone(),
+            subscribed_at: now,
+            next_billing_at: now + interval_seconds,
+            billing_count: 0,
+            status: SubscriptionStatus::Active,
+        };
+
+        storage::save_subscription(&env, &sub);
+        // Append to the merchant's subscription index so it is discoverable
+        // via `list_subscriptions_by_merchant`.
+        storage::push_merchant_subscription_id(&env, &plan.merchant_address, &subscription_id);
+
+        env.events().publish(
+            (String::from_str(&env, "subscription_created"),),
+            (subscription_id, plan_id, subscriber),
+        );
+        Ok(())
+    }
+
+    /// Cancel an active subscription.
+    ///
+    /// Callable by the subscriber or the merchant.  Updates the subscription
+    /// status to `Cancelled` but intentionally retains the record in storage
+    /// and in the `MerchantSubscriptions` index so historical queries remain
+    /// accurate.
+    pub fn cancel_subscription(
+        env: Env,
+        caller: Address,
+        subscription_id: Bytes,
+    ) -> Result<(), PaymentError> {
+        caller.require_auth();
+
+        let mut sub = storage::get_subscription(&env, &subscription_id)
+            .ok_or(PaymentError::PaymentNotFound)?;
+
+        if caller != sub.subscriber && caller != sub.merchant_address {
+            return Err(PaymentError::Unauthorized);
+        }
+
+        if sub.status == SubscriptionStatus::Cancelled {
+            return Err(PaymentError::InvalidInput);
+        }
+
+        sub.status = SubscriptionStatus::Cancelled;
+        storage::save_subscription(&env, &sub);
+
+        env.events().publish(
+            (String::from_str(&env, "subscription_cancelled"),),
+            (subscription_id, caller),
+        );
+        Ok(())
+    }
+
+    /// Return a paginated list of all subscriptions for `merchant`.
+    ///
+    /// # Access control
+    /// Callable by the merchant themselves or the contract admin.
+    ///
+    /// # Pagination
+    /// - `cursor` — pass `None` for the first page; pass the `next_cursor`
+    ///   from the previous response to retrieve the following page.
+    /// - `limit` — number of records per page, capped at 100.
+    ///
+    /// The cursor is the `subscription_id` of the last record on the previous
+    /// page.  Records are returned in insertion order (oldest first).
+    ///
+    /// # TTL
+    /// Both the `MerchantSubscriptions` index and every `SubscriptionState`
+    /// record loaded during this call have their TTL extended.
+    pub fn list_subscriptions_by_merchant(
+        env: Env,
+        caller: Address,
+        merchant: Address,
+        cursor: Option<Bytes>,
+        limit: u32,
+    ) -> Result<SubscriptionPage, PaymentError> {
+        caller.require_auth();
+
+        // Only the merchant or an admin may call this function
+        let is_admin = if let Some(config) = storage::get_admin_config(&env) {
+            config.admins.contains(&caller)
+        } else if let Some(admin) = storage::get_admin(&env) {
+            admin == caller
+        } else {
+            false
+        };
+
+        if caller != merchant && !is_admin {
+            return Err(PaymentError::Unauthorized);
+        }
+
+        let ids = storage::get_merchant_subscription_ids(&env, &merchant);
+        let cap = (limit.min(100)) as usize;
+        let total = ids.len() as u32;
+
+        let mut records: Vec<SubscriptionState> = Vec::new(&env);
+        let mut skip = cursor.is_some();
+        let mut count = 0usize;
+
+        for id in ids.iter() {
+            if skip {
+                if Some(id.clone()) == cursor {
+                    skip = false;
+                }
+                continue;
+            }
+            if count >= cap {
+                break;
+            }
+            if let Some(sub) = storage::get_subscription(&env, &id) {
+                records.push_back(sub);
+                count += 1;
+            }
+        }
+
+        // Determine the next cursor: the subscription_id of the last record
+        // returned, if there are more records beyond this page.
+        let next_cursor = if (count == cap) && {
+            // Check whether more IDs remain after the current page
+            let last = records.get(records.len() - 1).map(|r| r.subscription_id.clone());
+            let mut found_last = false;
+            let mut has_more = false;
+            for id in ids.iter() {
+                if found_last {
+                    has_more = true;
+                    break;
+                }
+                if Some(id.clone()) == last {
+                    found_last = true;
+                }
+            }
+            has_more
+        } {
+            records.get(records.len() - 1).map(|r| r.subscription_id.clone())
+        } else {
+            None
+        };
+
+        Ok(SubscriptionPage {
+            records,
+            next_cursor,
+            total,
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

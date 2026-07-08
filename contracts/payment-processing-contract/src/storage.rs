@@ -3,6 +3,7 @@ use soroban_sdk::{Address, Bytes, Env, Vec};
 use crate::error::PaymentError;
 use crate::types::{
     AdminConfig, DataKey, GlobalStats, Merchant, MultisigPayment, PaymentRecord, RefundRecord,
+    SubscriptionPlan, SubscriptionState,
 };
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -363,4 +364,106 @@ pub fn increment_refund_stats(env: &Env, amount: i128) -> Result<(), PaymentErro
         .ok_or(PaymentError::ArithmeticError)?;
     save_global_stats(env, &stats);
     Ok(())
+}
+
+// ── Subscriptions ─────────────────────────────────────────────────────────────
+
+/// Retrieve a subscription plan by ID. Returns `None` if not found.
+/// Extends TTL on every read to keep frequently accessed plans alive.
+pub fn get_subscription_plan(env: &Env, plan_id: &Bytes) -> Option<SubscriptionPlan> {
+    let key = DataKey::SubscriptionPlan(plan_id.clone());
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+    }
+    result
+}
+
+/// Persist a subscription plan and refresh its TTL.
+pub fn save_subscription_plan(env: &Env, plan: &SubscriptionPlan) {
+    let key = DataKey::SubscriptionPlan(plan.plan_id.clone());
+    env.storage().persistent().set(&key, plan);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+}
+
+/// Retrieve an individual subscription state by subscription ID.
+/// Extends TTL on every read.
+pub fn get_subscription(env: &Env, subscription_id: &Bytes) -> Option<SubscriptionState> {
+    let key = DataKey::Subscription(subscription_id.clone());
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+    }
+    result
+}
+
+/// Persist a subscription state and refresh its TTL.
+pub fn save_subscription(env: &Env, sub: &SubscriptionState) {
+    let key = DataKey::Subscription(sub.subscription_id.clone());
+    env.storage().persistent().set(&key, sub);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+}
+
+// ── MerchantSubscriptions index ───────────────────────────────────────────────
+//
+// The `MerchantSubscriptions(Address)` key stores a `Vec<Bytes>` of all
+// subscription IDs that belong to a given merchant.  The index is append-only
+// on subscribe and filtered on cancellation.  TTL is extended on every read
+// and write so active merchants never lose their index.
+
+/// Return the list of subscription IDs for `merchant`.
+/// Returns an empty `Vec` if no subscriptions exist yet.
+/// Extends TTL on every read.
+pub fn get_merchant_subscription_ids(env: &Env, merchant: &Address) -> Vec<Bytes> {
+    let key = DataKey::MerchantSubscriptions(merchant.clone());
+    let result: Option<Vec<Bytes>> = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+    }
+    result.unwrap_or_else(|| Vec::new(env))
+}
+
+/// Append a subscription ID to the merchant's index and refresh TTL.
+pub fn push_merchant_subscription_id(
+    env: &Env,
+    merchant: &Address,
+    subscription_id: &Bytes,
+) {
+    let mut ids = get_merchant_subscription_ids(env, merchant);
+    ids.push_back(subscription_id.clone());
+    let key = DataKey::MerchantSubscriptions(merchant.clone());
+    env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
+}
+
+/// Remove a subscription ID from the merchant's index (used on cancellation).
+pub fn remove_merchant_subscription_id(
+    env: &Env,
+    merchant: &Address,
+    subscription_id: &Bytes,
+) {
+    let ids = get_merchant_subscription_ids(env, merchant);
+    let mut new_ids = Vec::new(env);
+    for id in ids.iter() {
+        if id != *subscription_id {
+            new_ids.push_back(id);
+        }
+    }
+    let key = DataKey::MerchantSubscriptions(merchant.clone());
+    env.storage().persistent().set(&key, &new_ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_LEDGERS);
 }

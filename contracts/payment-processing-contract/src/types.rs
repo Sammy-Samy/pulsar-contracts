@@ -1,5 +1,96 @@
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Vec};
 
+// ── Subscription ──────────────────────────────────────────────────────────────
+
+/// The billing interval for a subscription plan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BillingInterval {
+    /// Billed once every 7 days.
+    Weekly,
+    /// Billed once every 30 days.
+    Monthly,
+    /// Billed once every 365 days.
+    Yearly,
+}
+
+/// A subscription plan created by a merchant.
+///
+/// Subscribers are tracked via the `MerchantSubscriptions(merchant_address)`
+/// storage index.  Each individual subscription is stored under
+/// `DataKey::Subscription(subscription_id)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlan {
+    /// Globally unique identifier for this subscription plan.
+    pub plan_id: Bytes,
+    /// Address of the merchant who owns this plan.
+    pub merchant_address: Address,
+    /// Token contract used for billing.
+    pub token: Address,
+    /// Amount charged per billing cycle, in the token's smallest denomination.
+    pub amount: i128,
+    /// Human-readable plan name (max 64 bytes).
+    pub name: String,
+    /// Human-readable plan description (max 256 bytes).
+    pub description: String,
+    /// Billing cadence.
+    pub interval: BillingInterval,
+    /// Whether new subscribers can join this plan.
+    pub active: bool,
+    /// Unix timestamp (seconds) when the plan was created.
+    pub created_at: u64,
+}
+
+/// Current lifecycle state of a subscriber's subscription.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubscriptionStatus {
+    /// Subscription is active and billing is ongoing.
+    Active,
+    /// Subscriber paused the subscription voluntarily.
+    Paused,
+    /// Subscription was cancelled and is no longer billable.
+    Cancelled,
+}
+
+/// The state of a single subscriber enrolled in a `SubscriptionPlan`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionState {
+    /// Globally unique identifier for this subscription instance.
+    pub subscription_id: Bytes,
+    /// The plan this subscription belongs to.
+    pub plan_id: Bytes,
+    /// Merchant who owns the plan.
+    pub merchant_address: Address,
+    /// Subscriber (payer) address.
+    pub subscriber: Address,
+    /// Unix timestamp (seconds) when the subscriber enrolled.
+    pub subscribed_at: u64,
+    /// Unix timestamp (seconds) of the next scheduled billing event.
+    pub next_billing_at: u64,
+    /// Cumulative number of successful billing cycles.
+    pub billing_count: u64,
+    /// Current lifecycle state.
+    pub status: SubscriptionStatus,
+}
+
+/// Paginated response for subscription queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPage {
+    /// The subscriptions on this page.
+    pub records: Vec<SubscriptionState>,
+    /// Cursor pointing to the last record on this page.
+    ///
+    /// Pass this value as `cursor` in the next call to retrieve the following
+    /// page.  `None` means this is the last page.
+    pub next_cursor: Option<Bytes>,
+    /// Total number of subscriptions in the index (before pagination).
+    pub total: u32,
+}
+
 // ── Merchant ──────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -187,4 +278,13 @@ pub enum DataKey {
     AllRefunds,
     WhitelistEnabled,
     Whitelist(Address),
+    /// Individual subscription plan keyed by plan ID.
+    SubscriptionPlan(Bytes),
+    /// Individual subscription state (subscriber + plan) keyed by subscription ID.
+    Subscription(Bytes),
+    /// Per-merchant index: `Vec<Bytes>` of subscription IDs for fast enumeration.
+    ///
+    /// Updated atomically on `subscribe` / `cancel_subscription`.
+    /// TTL is extended on every read and write.
+    MerchantSubscriptions(Address),
 }

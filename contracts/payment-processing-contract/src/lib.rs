@@ -171,6 +171,8 @@ impl PaymentContract {
         }
 
         let now = env.ledger().timestamp();
+        // expires_at == 0 is the sentinel for "no expiry" — skip the check.
+        // Any non-zero value is treated as an absolute Unix timestamp deadline.
         if order.expires_at > 0 && now > order.expires_at {
             return Err(PaymentError::PaymentExpired);
         }
@@ -731,6 +733,7 @@ impl PaymentContract {
 
         let order = &ms.order;
         if order.expires_at > 0 && now > order.expires_at {
+            // expires_at == 0 means no expiry; see PaymentOrder.expires_at docs.
             return Err(PaymentError::PaymentExpired);
         }
 

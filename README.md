@@ -291,6 +291,20 @@ stellar contract invoke --id $CONTRACT_ID --source-account <PAYER_KEY> --network
   --merchant_public_key <32_BYTE_HEX>
 ```
 
+**`PaymentOrder` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | `Bytes` (max 64 B) | Unique order identifier — never reuse an ID |
+| `merchant_address` | `Address` | Registered merchant receiving the payment |
+| `payer` | `Address` | Payer address; must match the transaction signer |
+| `token` | `Address` | Token contract address |
+| `amount` | `i128` | Payment amount in the token's smallest denomination (must be > 0) |
+| `description` | `String` | Human-readable description |
+| `expires_at` | `u64` | Unix timestamp (seconds) after which the order is rejected as expired. **Set to `0` for no expiry.** When `0`, the contract skips the expiry check and the order can be processed at any future time. If a deadline matters, always supply a non-zero future timestamp (e.g. `now + 3600`). |
+
+> **No-expiry orders (`expires_at == 0`):** These are intentionally permitted for standing orders, test environments, and other cases where a hard deadline is not meaningful. The unique `order_id` prevents replay: once an order is processed its ID is stored on-chain and any subsequent attempt with the same ID fails with `PaymentAlreadyExists`. See [ADR-0004](docs/adr/0004-expires-at-zero-semantics.md) for the full decision record.
+
 ---
 
 ### Payment Queries

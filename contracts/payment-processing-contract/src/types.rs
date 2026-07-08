@@ -44,6 +44,23 @@ pub struct PaymentOrder {
     pub token: Address,
     pub amount: i128,
     pub description: String,
+    /// Unix timestamp (seconds) after which this order is considered expired.
+    ///
+    /// **Special value `0` means the order never expires.**
+    ///
+    /// When `expires_at == 0` the contract skips the expiry check entirely and
+    /// the order can be processed at any point in the future.  This is
+    /// intentional — there are legitimate use cases (e.g. standing orders,
+    /// test environments) where an expiry deadline is not meaningful.
+    ///
+    /// # Guidance for integrators
+    /// - If your use case requires a hard deadline, always set `expires_at` to
+    ///   a future Unix timestamp.  A good default is `now + 3600` (1 hour).
+    /// - If you supply `0` without intending a non-expiring order, the payment
+    ///   can be replayed indefinitely (until the `order_id` is consumed).
+    ///   Ensure the `order_id` is unique and not reusable.
+    ///
+    /// See ADR-0004 for the full decision record on this behaviour.
     pub expires_at: u64,
 }
 

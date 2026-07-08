@@ -345,6 +345,19 @@ stellar contract invoke --id $CONTRACT_ID --source-account <PAYER_KEY> --network
 **Sort orders**: `Ascending` | `Descending`  
 **Pagination**: pass the `next_cursor` from the previous response as `cursor`. Max 100 results per page.
 
+> **Cursor format:** The `next_cursor` value in `PaymentPage` is the raw
+> bytes of the `order_id` of the last record on the page — exactly the bytes
+> stored when the payment was originally processed (UTF-8 if you used a string
+> ID, raw binary if you used a hash).
+>
+> Always treat the cursor as an **opaque blob** and pass it back verbatim.
+> Do not construct or modify cursors manually — the internal encoding is tied
+> to the sort order and may change in future versions.  A cursor is only valid
+> for the same `sort_field` / `sort_order` it was generated with.
+>
+> See [ADR-0005](docs/adr/0005-cursor-format.md) for the full design rationale
+> and migration guidance.
+
 #### `get_global_payment_stats` *(admin only)*
 
 ```bash

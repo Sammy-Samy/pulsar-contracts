@@ -135,11 +135,53 @@ pub struct PaymentFilter {
     pub status: StatusFilter,
 }
 
+/// A single page of payment records returned by history query functions.
+///
+/// # Cursor format
+///
+/// `next_cursor` is the raw `order_id` bytes of the **last record on this
+/// page**.  It is intentionally opaque to on-chain callers — the contract
+/// only needs to find the cursor value inside its sorted ID list to resume
+/// iteration.
+///
+/// For off-chain clients the bytes are the exact bytes of the `order_id` that
+/// was stored when the payment was processed.  The encoding depends on how the
+/// caller originally constructed the `order_id`:
+///
+/// - If the caller used a UTF-8 string (e.g. `"ORDER_001"`), the bytes are
+///   the UTF-8 representation of that string.
+/// - If the caller used a hash or other binary ID, the bytes are the raw
+///   binary without any additional encoding.
+///
+/// Off-chain clients should treat `next_cursor` as an **opaque blob** and
+/// round-trip it verbatim.  Do **not** attempt to decode or construct cursors
+/// from scratch — the internal sort order may change in a future version and
+/// the cursor value would silently point to a different position.  See
+/// [ADR-0003](../../../../docs/adr/0003-pagination-design.md) and
+/// [ADR-0005](../../../../docs/adr/0005-cursor-format.md) for the full design
+/// rationale and migration guidance.
+///
+/// # Pagination flow
+///
+/// ```text
+/// first call:  cursor = None   → returns page 1, next_cursor = Some(<id>)
+/// second call: cursor = Some(<id>) → returns page 2, next_cursor = Some(<id>)
+/// ...
+/// last page:   cursor = Some(<id>) → returns page N, next_cursor = None
+/// ```
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentPage {
+    /// The payment records on this page (at most `limit`, capped at 100).
     pub records: Vec<PaymentRecord>,
+    /// Cursor to pass as `cursor` on the next call to get the following page.
+    ///
+    /// `None` when this is the final page.  The value is the raw `order_id`
+    /// bytes of the last record returned; see struct-level docs for details.
     pub next_cursor: Option<Bytes>,
+    /// Total number of matching records across all pages (before truncation to
+    /// `limit`).  Useful for progress indicators but not for computing page
+    /// count without iterating (because filtered totals are not pre-computed).
     pub total: u32,
 }
 

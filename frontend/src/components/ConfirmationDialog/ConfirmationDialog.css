@@ -1,0 +1,110 @@
+.cd-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1rem;
+}
+
+.cd-dialog {
+  background: var(--color-bg);
+  color: var(--color-text);
+  border-radius: 0.5rem;
+  box-shadow: var(--shadow-2xl);
+  width: 100%;
+  max-width: 28rem;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  border: 1px solid var(--color-border);
+}
+
+.cd-header {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+
+.cd-icon { font-size: 1.25rem; color: var(--color-error); }
+
+.cd-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--color-error);
+}
+
+.cd-description {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.cd-consequences {
+  margin: 0;
+  padding-left: 1.25rem;
+  font-size: 0.875rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  color: var(--color-error-dark);
+}
+
+[data-theme="dark"] .cd-consequences {
+  color: var(--color-error);
+}
+
+.cd-warning {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-warning-dark);
+  background: var(--color-warning-light);
+  border: 1px solid var(--color-warning);
+  border-radius: 0.25rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.cd-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.cd-btn {
+  padding: 0.5rem 1.25rem;
+  border-radius: 0.375rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.cd-btn--cancel {
+  background: transparent;
+  border-color: var(--color-border);
+  color: inherit;
+}
+
+.cd-btn--cancel:hover {
+  background: var(--color-surface);
+}
+
+.cd-btn--confirm {
+  background: var(--color-error);
+  color: var(--color-text-inverse);
+}
+
+.cd-btn--confirm:hover {
+  background: var(--color-error-dark);
+}
+
+.cd-btn:focus-visible {
+  outline: 2px solid var(--color-info);
+  outline-offset: 2px;
+}

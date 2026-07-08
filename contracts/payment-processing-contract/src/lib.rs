@@ -1368,6 +1368,31 @@ impl PaymentContract {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    /// Shared pagination implementation for merchant and payer history queries.
+    ///
+    /// # Cursor mechanics
+    ///
+    /// The cursor is the **raw `order_id` bytes** of the last record on the
+    /// previous page.  This value is sourced directly from `PaymentPage.next_cursor`
+    /// returned by the previous call — callers must not modify it.
+    ///
+    /// Internally, the function scans the caller's ID list in order and skips
+    /// all records up to and including the cursor.  Iteration then resumes from
+    /// the next ID.  This means:
+    ///
+    /// - The cursor is **position-stable within a fixed sort order**: as long
+    ///   as `sort_field` and `sort_order` are the same across calls, the cursor
+    ///   reliably points to the correct resume position.
+    /// - Changing `sort_field` / `sort_order` between calls **invalidates the
+    ///   cursor** — the old cursor value is meaningless in the new ordering.
+    /// - Only **forward** iteration is supported; there is no reverse-cursor.
+    ///
+    /// # Migration note
+    ///
+    /// If the cursor encoding is ever changed (e.g. moving to a base64-wrapped
+    /// version-prefixed format), existing stored cursors will break.  Any such
+    /// change must increment `DataKey::ContractVersion` and be accompanied by a
+    /// new ADR that supersedes ADR-0005.
     fn paginate_payments(
         env: &Env,
         ids: Vec<Bytes>,
